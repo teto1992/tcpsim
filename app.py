@@ -1,12 +1,12 @@
 # streamlit_app.py
 # TCP congestion control toy simulator with algorithm picker
-# NOTE: This is a *didactic* discrete‑RTT model. It is not ns-3 nor Linux TCP.
+# NOTE: This is a *didactic* discrete-RTT model. It is not ns-3 nor Linux TCP.
 # It aims to visualize trends and relative behaviors under configurable path params.
 
 import math
 import random
 from dataclasses import dataclass
-from typing import List, Dict, Callable
+from typing import List, Dict, Callable, Tuple
 
 import numpy as np
 import pandas as pd
@@ -15,19 +15,27 @@ import plotly.graph_objects as go
 import streamlit as st
 
 # ------------------------------
+# Helpers
+# ------------------------------
+def compute_bdp_packets(bandwidth_mbps: float, rtt_ms: float, mss_bytes: int) -> float:
+    bits_per_rtt = bandwidth_mbps * 1e6 * (rtt_ms / 1000.0)
+    return bits_per_rtt / (8 * mss_bytes)
+
+# ------------------------------
 # Path & simulation parameters
 # ------------------------------
 @dataclass
 class Path:
-    bandwidth_mbps: float = 100.0  # link capacity
-    rtt_ms: float = 100.0          # base RTT (no queue)
-    loss_prob: float = 0.05         # i.i.d. per-packet loss probability
+    bandwidth_mbps: float = 100.0   # base link capacity
+    rtt_ms: float = 100.0           # base RTT (no queue)
+    loss_prob: float = 0.01         # i.i.d. per-packet loss probability
     mss_bytes: int = 1460
+    bw_variation_frac: float = 0.0  # +/- fractional variation per RTT (e.g., 0.5 => ±50%)
+    rtt_variation_frac: float = 0.0 # +/- fractional variation per RTT
 
     @property
     def bdp_packets(self) -> float:
-        bits_per_rtt = self.bandwidth_mbps * 1e6 * (self.rtt_ms/1000.0)
-        return bits_per_rtt / (8 * self.mss_bytes)
+        return compute_bdp_packets(self.bandwidth_mbps, self.rtt_ms, self.mss_bytes)
 
 # RNG helper for reproducibility
 class RNG:
@@ -35,23 +43,38 @@ class RNG:
         self.rng = random.Random(seed)
     def bernoulli(self, p: float) -> bool:
         return self.rng.random() < p
+    def uniform(self, a: float, b: float) -> float:
+        return self.rng.uniform(a, b)
 
 # ------------------------------
 # Utility: one-RTT loss event probability given cwnd & per-pkt loss p
 # For Reno-like loss signaling via duplicate ACKs, approximate the prob
 # that at least one pkt in window is lost.
 # ------------------------------
-
 def window_loss_event_prob(cwnd_pkts: float, p_pkt: float) -> float:
     cwnd = max(1.0, cwnd_pkts)
     # P(no loss in window) = (1-p)^cwnd  => P(loss) = 1 - (1-p)^cwnd
     return 1.0 - (1.0 - p_pkt) ** cwnd
 
+# Classify loss event into dupACK vs timeout (didactic heuristic)
+def classify_loss_event(cwnd_pkts: float, rng: RNG) -> str:
+    """
+    Returns 'dup3ack', 'timeout', or 'none'.
+    Heuristic:
+      - If cwnd >= 4: mostly dup3ack, small chance timeout (e.g., burst losses).
+      - If cwnd < 4: likely timeout (no room for 3 duplicate ACKs).
+    """
+    if cwnd_pkts >= 4.0:
+        # 85% dupACK, 15% timeout
+        return "dup3ack" if rng.bernoulli(0.85) else "timeout"
+    else:
+        # 80% timeout, 20% dupACK (rare ma possibile)
+        return "timeout" if rng.bernoulli(0.80) else "dup3ack"
+
 # ------------------------------
 # Discrete-RTT toy models for congestion control variants
 # Each returns new cwnd, ssthresh and meta (dict)
 # ------------------------------
-
 @dataclass
 class CCState:
     cwnd: float
@@ -62,173 +85,201 @@ class CCState:
     # BBR state
     btlbw_mbps: float = 0.0
 
-# Tahoe
-
-def step_tahoe(state: CCState, path: Path, rng: RNG):
-    loss_evt = rng.bernoulli(window_loss_event_prob(state.cwnd, path.loss_prob))
+# Tahoe (loss-based)
+def step_tahoe(state: CCState, path: Path, rng: RNG) -> Tuple[CCState, Dict]:
+    loss_happened = rng.bernoulli(window_loss_event_prob(state.cwnd, path.loss_prob))
+    event = "none"
     if state.cwnd < state.ssthresh:  # slow start (SS)
         state.cwnd *= 2.0
     else:                            # congestion avoidance (CA)
         state.cwnd += 1.0
-    if loss_evt:
+    if loss_happened:
+        event = classify_loss_event(state.cwnd, rng)
+        # Tahoe: su dup3ack e su timeout si torna a cwnd=1, ssthresh = cwnd/2
         state.ssthresh = max(2.0, state.cwnd / 2.0)
-        state.cwnd = 1.0  # Tahoe goes back to 1 MSS
-    return state, {"loss": loss_evt}
+        state.cwnd = 1.0
+    return state, {"loss": loss_happened, "event": event}
 
-# Reno
-
-def step_reno(state: CCState, path: Path, rng: RNG):
-    loss_evt = rng.bernoulli(window_loss_event_prob(state.cwnd, path.loss_prob))
+# Reno (loss-based)
+def step_reno(state: CCState, path: Path, rng: RNG) -> Tuple[CCState, Dict]:
+    loss_happened = rng.bernoulli(window_loss_event_prob(state.cwnd, path.loss_prob))
+    event = "none"
     if state.cwnd < state.ssthresh:
         state.cwnd *= 2.0
     else:
         state.cwnd += 1.0
-    if loss_evt:
-        state.ssthresh = max(2.0, state.cwnd / 2.0)
-        state.cwnd = max(1.0, state.ssthresh)  # fast recovery approx
-    return state, {"loss": loss_evt}
+    if loss_happened:
+        event = classify_loss_event(state.cwnd, rng)
+        if event == "dup3ack":
+            # Fast retransmit + fast recovery (approx)
+            state.ssthresh = max(2.0, state.cwnd / 2.0)
+            state.cwnd = max(1.0, state.ssthresh)
+        else:  # timeout
+            state.ssthresh = max(2.0, state.cwnd / 2.0)
+            state.cwnd = 1.0
+    return state, {"loss": loss_happened, "event": event}
 
-# NewReno (very similar in this toy model)
-
-def step_newreno(state: CCState, path: Path, rng: RNG):
-    # Slightly less drastic cwnd deflation on loss vs Reno
-    loss_evt = rng.bernoulli(window_loss_event_prob(state.cwnd, path.loss_prob))
-    if state.cwnd < state.ssthresh:
-        state.cwnd *= 2.0
-    else:
-        state.cwnd += 1.0
-    if loss_evt:
-        state.ssthresh = max(2.0, state.cwnd / 2.0)
-        state.cwnd = max(1.0, 0.7 * state.ssthresh)  # gentler deflation
-    return state, {"loss": loss_evt}
-
-# CUBIC (high-level approximation)
-# W_cubic(t) = C*(t-K)^3 + Wmax, where K=(Wmax*β/C)^{1/3}; β≈0.7, C≈0.4
-# We discretize time by RTTs; on loss, Wmax <- cwnd, cwnd <- cwnd*(1-β)
-
-def step_cubic(state: CCState, path: Path, rng: RNG):
-    beta = 0.3  # multiplicative decrease ~ 1-β in Linux docs (β~0.3)
+# CUBIC (loss-based, high-level approximation)
+# W_cubic(t) = C*(t-K)^3 + Wmax, where K=(Wmax*β/C)^{1/3}; β≈0.3, C≈0.4
+def step_cubic(state: CCState, path: Path, rng: RNG) -> Tuple[CCState, Dict]:
+    beta = 0.3  # multiplicative decrease ~ (1-β)
     C = 0.4
-    loss_evt = rng.bernoulli(window_loss_event_prob(state.cwnd, path.loss_prob))
-    if loss_evt:
+    loss_happened = rng.bernoulli(window_loss_event_prob(state.cwnd, path.loss_prob))
+    event = "none"
+    if loss_happened:
+        event = classify_loss_event(state.cwnd, rng)
         state.Wmax = max(state.Wmax, state.cwnd)
-        state.cwnd = max(1.0, state.cwnd * (1.0 - beta))
-        state.epoch = 0
+        if event == "dup3ack":
+            # classico backoff moltiplicativo
+            state.cwnd = max(1.0, state.cwnd * (1.0 - beta))
+            state.epoch = 0
+        else:  # timeout: più severo
+            state.ssthresh = max(2.0, state.cwnd / 2.0)
+            state.cwnd = 1.0
+            state.Wmax = 0.0
+            state.epoch = 0
     else:
         # cubic growth from last Wmax
         t = state.epoch
-        K = (state.Wmax * beta / C) ** (1.0/3.0) if state.Wmax > 0 else 0.0
-        Wt = C * (t - K) ** 3 + state.Wmax
-        state.cwnd = max(state.cwnd + 1.0, Wt) if state.Wmax > 0 else state.cwnd + 1.0
+        K = (state.Wmax * beta / C) ** (1.0 / 3.0) if state.Wmax > 0 else 0.0
+        Wt = C * (t - K) ** 3 + state.Wmax if state.Wmax > 0 else state.cwnd + 1.0
+        state.cwnd = max(state.cwnd + 1.0, Wt)
         state.epoch += 1
-    return state, {"loss": loss_evt}
+    return state, {"loss": loss_happened, "event": event}
 
-# Vegas (delay-based): try to keep ~α..β packets queued; adjust cwnd toward BDP
-
-def step_vegas(state: CCState, path: Path, rng: RNG):
+# Vegas (delay-inspired; reagisce poco alla perdita)
+def step_vegas(state: CCState, path: Path, rng: RNG) -> Tuple[CCState, Dict]:
     alpha, beta = 3.0, 6.0
-    # Estimate baseRTT as path.rtt_ms; queuing ~ (cwnd - BDP)
     target_low = path.bdp_packets + alpha
     target_high = path.bdp_packets + beta
     if state.cwnd < target_low:
         state.cwnd += 1.0
     elif state.cwnd > target_high:
         state.cwnd = max(1.0, state.cwnd - 1.0)
-    # Vegas reacts little to random loss; if loss, small decrease
     loss_evt = rng.bernoulli(window_loss_event_prob(state.cwnd, path.loss_prob))
     if loss_evt:
         state.cwnd = max(1.0, state.cwnd * 0.9)
-    return state, {"loss": loss_evt}
+    # Non etichettiamo dup3ack/timeout per gli algoritmi non loss-based
+    return state, {"loss": loss_evt, "event": "none"}
 
-# "NewVegas" (placeholder: same spirit, tighter target)
-
-def step_newvegas(state: CCState, path: Path, rng: RNG):
-    alpha, beta = 2.0, 4.0
-    target_low = path.bdp_packets + alpha
-    target_high = path.bdp_packets + beta
-    if state.cwnd < target_low:
-        state.cwnd += 1.0
-    elif state.cwnd > target_high:
-        state.cwnd = max(1.0, state.cwnd - 1.0)
-    loss_evt = rng.bernoulli(window_loss_event_prob(state.cwnd, path.loss_prob))
-    if loss_evt:
-        state.cwnd = max(1.0, state.cwnd * 0.92)
-    return state, {"loss": loss_evt}
-
-# BBR (model): pace at BtlBw, cwnd ≈ 2*BDP; ignore random loss unless severe
-
-def step_bbr(state: CCState, path: Path, rng: RNG):
-    # In this toy, assume measured bottleneck bandwidth = link capacity
+# BBR (model-based)
+def step_bbr(state: CCState, path: Path, rng: RNG) -> Tuple[CCState, Dict]:
     state.btlbw_mbps = path.bandwidth_mbps
     target_cwnd = max(4.0, 2.0 * path.bdp_packets)
-    # Probe: oscillate slightly around target
     state.epoch += 1
     oscillation = 0.1 * math.sin(state.epoch / 5.0)
     state.cwnd = max(1.0, target_cwnd * (1.0 + oscillation))
-    # Loss does not drive cwnd directly here
     loss_evt = rng.bernoulli(window_loss_event_prob(state.cwnd, path.loss_prob))
-    return state, {"loss": loss_evt}
+    return state, {"loss": loss_evt, "event": "none"}
 
-# Map names to step funcs and initializers
+# Map names to step funcs and initializers (LIMITED SET)
 ALGORITHMS: Dict[str, Callable[[CCState, Path, RNG], tuple]] = {
     "Tahoe": step_tahoe,
     "Reno": step_reno,
-    "NewReno": step_newreno,
     "CUBIC": step_cubic,
     "Vegas": step_vegas,
-    "NewVegas": step_newvegas,
     "BBR": step_bbr,
 }
+
+# Fixed colors per algorithm (consistent palette)
+COLOR_MAP = {
+    "Tahoe": "#1f77b4",  # blue
+    "Reno":  "#ff7f0e",  # orange
+    "CUBIC": "#2ca02c",  # green
+    "Vegas": "#d62728",  # red
+    "BBR":   "#9467bd",  # purple
+}
+
+LOSS_BASED = {"Tahoe", "Reno", "CUBIC"}
 
 # ------------------------------
 # Simulation engine
 # ------------------------------
-
-def simulate(algo: str, path: Path, duration_s: float, seed: int) -> pd.DataFrame:
+def simulate(algo: str, base_path: Path, duration_s: float, seed: int) -> pd.DataFrame:
     rng = RNG(seed + hash(algo) % 100000)
-    # Initialize per‑algo state
-    if algo in ("Tahoe", "Reno", "NewReno"):
-        state = CCState(cwnd=1.0, ssthresh=path.bdp_packets)  # start in slow start
+    # Initialize per-algo state
+    if algo in ("Tahoe", "Reno"):
+        state = CCState(cwnd=1.0, ssthresh=compute_bdp_packets(base_path.bandwidth_mbps, base_path.rtt_ms, base_path.mss_bytes))
     elif algo == "CUBIC":
         state = CCState(cwnd=1.0, ssthresh=1e9, Wmax=0.0, epoch=0)
-    elif algo in ("Vegas", "NewVegas"):
-        state = CCState(cwnd=max(2.0, path.bdp_packets/2), ssthresh=1e9)
+    elif algo == "Vegas":
+        state = CCState(cwnd=max(2.0, compute_bdp_packets(base_path.bandwidth_mbps, base_path.rtt_ms, base_path.mss_bytes) / 2), ssthresh=1e9)
     elif algo == "BBR":
-        state = CCState(cwnd=max(4.0, 2.0*path.bdp_packets/3), ssthresh=1e9, btlbw_mbps=path.bandwidth_mbps)
+        state = CCState(cwnd=max(4.0, 2.0 * compute_bdp_packets(base_path.bandwidth_mbps, base_path.rtt_ms, base_path.mss_bytes) / 3),
+                        ssthresh=1e9, btlbw_mbps=base_path.bandwidth_mbps)
     else:
         raise ValueError("Unknown algorithm")
 
-    rtts = int(max(1, duration_s / (path.rtt_ms/1000.0)))
     times = []
     cwnds = []
     send_rates = []
     goodputs = []
-    losses = []
+    loss_flags = []
+    event_types = []  # 'none' | 'dup3ack' | 'timeout'
 
     step_fn = ALGORITHMS[algo]
 
-    for r in range(rtts):
-        # Throughput limited by cwnd/RTT and link capacity
-        send_rate_mbps = min((state.cwnd * path.mss_bytes * 8) / (path.rtt_ms/1000.0) / 1e6,
-                             path.bandwidth_mbps)
-        # i.i.d per‑packet loss => expect goodput scaled by (1-p)
+    # working copy of path to allow per-RTT variation
+    path = Path(
+        bandwidth_mbps=base_path.bandwidth_mbps,
+        rtt_ms=base_path.rtt_ms,
+        loss_prob=base_path.loss_prob,
+        mss_bytes=base_path.mss_bytes,
+        bw_variation_frac=base_path.bw_variation_frac,
+        rtt_variation_frac=base_path.rtt_variation_frac,
+    )
+
+    # cumulative time (seconds) to handle variable RTT per step
+    t_s = 0.0
+    max_iters = int(1e6)  # safety guard
+
+    iters = 0
+    while t_s < duration_s and iters < max_iters:
+        iters += 1
+        # Bandwidth variation per RTT (uniform in [-frac, +frac])
+        if path.bw_variation_frac > 0:
+            delta_bw = rng.uniform(-path.bw_variation_frac, path.bw_variation_frac)
+            inst_bw = max(1e-6, base_path.bandwidth_mbps * (1.0 + delta_bw))
+        else:
+            inst_bw = base_path.bandwidth_mbps
+
+        # RTT variation per RTT (uniform in [-frac, +frac])
+        if base_path.rtt_variation_frac > 0:
+            delta_rtt = rng.uniform(-base_path.rtt_variation_frac, base_path.rtt_variation_frac)
+            inst_rtt_ms = max(0.1, base_path.rtt_ms * (1.0 + delta_rtt))  # clamp for stability
+        else:
+            inst_rtt_ms = base_path.rtt_ms
+
+        # Expose instantaneous values to algorithms
+        path.bandwidth_mbps = inst_bw
+        path.rtt_ms = inst_rtt_ms
+
+        # Throughput limited by cwnd/RTT and instantaneous link capacity
+        send_rate_mbps = min((state.cwnd * path.mss_bytes * 8) / (inst_rtt_ms / 1000.0) / 1e6,
+                             inst_bw)
+        # i.i.d per-packet loss => expect goodput scaled by (1-p)
         goodput_mbps = send_rate_mbps * (1.0 - path.loss_prob)
 
-        times.append(r * path.rtt_ms/1000.0)
+        times.append(t_s)
         cwnds.append(state.cwnd)
         send_rates.append(send_rate_mbps)
         goodputs.append(goodput_mbps)
 
         # Advance CC by one RTT
         state, meta = step_fn(state, path, rng)
-        losses.append(1 if meta.get("loss", False) else 0)
+        loss_flags.append(1 if meta.get("loss", False) else 0)
+        event_types.append(meta.get("event", "none"))
+
+        # Advance cumulative time by the instantaneous RTT
+        t_s += inst_rtt_ms / 1000.0
 
     df = pd.DataFrame({
         "time_s": times,
         "cwnd_pkts": cwnds,
         "send_mbps": send_rates,
         "goodput_mbps": goodputs,
-        "loss_event": losses,
+        "loss_event": loss_flags,
+        "event_type": event_types,  # 'none' | 'dup3ack' | 'timeout'
         "algo": algo,
     })
     return df
@@ -236,34 +287,58 @@ def simulate(algo: str, path: Path, duration_s: float, seed: int) -> pd.DataFram
 # ------------------------------
 # Streamlit UI
 # ------------------------------
-
 st.set_page_config(page_title="TCP CC toy simulator", layout="wide")
 st.title("TCP Congestion Control – simulatore didattico")
 
 with st.sidebar:
     st.header("Parametri del link")
-    bw = st.number_input("Banda (Mbps)", 1.0, 10000.0, 100.0, 1.0)
-    rtt = st.number_input("RTT (ms)", 1.0, 2000.0, 100.0, 1.0)
-    loss = st.slider("Tasso di perdita per pacchetto", 0.0, 0.2, 0.05, 0.005)
+    bw = st.number_input("Banda base (Mbps)", 1.0, 10000.0, 100.0, 1.0)
+    rtt = st.number_input("RTT base (ms)", 1.0, 2000.0, 100.0, 1.0)
+
+    # Percent input for very low loss rates
+    loss_pct = st.number_input(
+        "Tasso di perdita (%)",
+        min_value=0.0,
+        max_value=100.0,
+        value=1.0,
+        step=0.01,
+        format="%.4f",
+        help="Inserisci la percentuale di perdita per pacchetto (es. 0.05 = 0.05%)"
+    )
+    loss = loss_pct / 100.0
+
     mss = st.selectbox("MSS (bytes)", [1200, 1360, 1460, 1500], index=2)
+
+    st.header("Variazione di banda (opz.)")
+    bw_var_pct = st.slider("Variazione banda istantanea ± (%)", 0, 50, 0, 1,
+                           help="Se >0, ad ogni RTT la banda varia in modo uniforme casuale nell'intervallo selezionato.")
+    bw_var_frac = bw_var_pct / 100.0
+
+    st.header("Variazione di RTT (opz.)")
+    rtt_var_pct = st.slider("Variazione RTT istantanea ± (%)", 0, 50, 0, 1,
+                            help="Se >0, ad ogni RTT il RTT varia in modo uniforme casuale nell'intervallo selezionato.")
+    rtt_var_frac = rtt_var_pct / 100.0
 
     st.header("Simulazione")
     duration = st.number_input("Durata (s)", 0.5, 600.0, 30.0, 0.5)
     seed = st.number_input("Seed", 0, 10_000_000, 42, 1)
 
     st.header("Algoritmi da plottare")
+    # Restricted set
     default_selection = ["CUBIC", "BBR", "Reno", "Vegas"]
     algos_selected = st.multiselect(
         "Scegli uno o più algoritmi",
-        list(ALGORITHMS.keys()),
+        ["Tahoe", "Reno", "CUBIC", "Vegas", "BBR"],
         default=default_selection,
     )
 
     st.header("Cosa visualizzare")
     what = st.radio("Serie temporali", ["Goodput (Mbps)", "cwnd (pacchetti)", "Send rate (Mbps)"])
-    show_losses = st.checkbox("Evidenzia eventi di perdita", value=False)
+    show_events = st.checkbox("Evidenzia 3dupACK e Timeout (solo algoritmi loss-based)", value=True)
 
-path = Path(bandwidth_mbps=bw, rtt_ms=rtt, loss_prob=loss, mss_bytes=mss)
+# Build base path (variation fractions included)
+path = Path(bandwidth_mbps=bw, rtt_ms=rtt, loss_prob=loss, mss_bytes=mss,
+            bw_variation_frac=bw_var_frac, rtt_variation_frac=rtt_var_frac)
 
 if not algos_selected:
     st.info("Seleziona almeno un algoritmo nella sidebar per iniziare.")
@@ -276,15 +351,20 @@ for name in algos_selected:
 all_df = pd.concat(frames, ignore_index=True)
 
 # KPIs
-col1, col2, col3, col4 = st.columns(4)
+base_bdp = compute_bdp_packets(bw, rtt, mss)
+col1, col2, col3, col4, col5, col6 = st.columns(6)
 with col1:
-    st.metric("BDP (pacchetti)", f"{path.bdp_packets:.1f}")
+    st.metric("BDP base (pacchetti)", f"{base_bdp:.1f}")
 with col2:
-    st.metric("Capacità link", f"{path.bandwidth_mbps:.1f} Mbps")
+    st.metric("Capacità base", f"{bw:.1f} Mbps")
 with col3:
-    st.metric("RTT", f"{path.rtt_ms:.0f} ms")
+    st.metric("RTT base", f"{rtt:.0f} ms")
 with col4:
-    st.metric("Perdita", f"{100*path.loss_prob:.1f}%")
+    st.metric("Perdita", f"{loss_pct:.4f}%")
+with col5:
+    st.metric("Var. banda ±", f"{100*path.bw_variation_frac:.0f}%")
+with col6:
+    st.metric("Var. RTT ±", f"{100*path.rtt_variation_frac:.0f}%")
 
 # Plot
 metric_map = {
@@ -294,20 +374,36 @@ metric_map = {
 }
 col, ylab = metric_map[what]
 
-fig = px.line(all_df, x="time_s", y=col, color="algo", render_mode="svg")
+fig = px.line(
+    all_df, x="time_s", y=col, color="algo", render_mode="svg",
+    color_discrete_map=COLOR_MAP,
+)
 fig.update_layout(xaxis_title="Tempo (s)", yaxis_title=ylab, legend_title_text="Algoritmo",
                   template="plotly_white")
 
-if show_losses:
-    # Overlay loss events as semi-transparent markers at the current metric value
-    loss_df = all_df[all_df["loss_event"] == 1]
-    if not loss_df.empty:
+if show_events:
+    # Solo algoritmi loss-based
+    events_df = all_df[all_df["algo"].isin(list(LOSS_BASED))]
+    # 3dupACK
+    dup_df = events_df[events_df["event_type"] == "dup3ack"]
+    if not dup_df.empty:
         fig.add_trace(go.Scatter(
-            x=loss_df["time_s"],
-            y=loss_df[col],
+            x=dup_df["time_s"],
+            y=dup_df[col],
             mode="markers",
-            marker=dict(color="red", size=6, opacity=0.4),
-            name="Perdita",
+            marker=dict(symbol="x", size=8, opacity=0.5, line=dict(width=0.5), color="#ff820e"),
+            name="3dupACK",
+            showlegend=True,
+        ))
+    # Timeout
+    to_df = events_df[events_df["event_type"] == "timeout"]
+    if not to_df.empty:
+        fig.add_trace(go.Scatter(
+            x=to_df["time_s"],
+            y=to_df[col],
+            mode="markers",
+            marker=dict(symbol="x", size=8, opacity=0.5, line=dict(width=1.2), color="#E92626"),
+            name="Timeout",
             showlegend=True,
         ))
 
@@ -315,13 +411,25 @@ st.plotly_chart(fig, use_container_width=True)
 
 # Aggregate stats
 st.subheader("Statistiche riassuntive")
+# Conta separatamente dup3ack e timeout
+def count_events(df: pd.DataFrame, etype: str) -> int:
+    return int((df["event_type"] == etype).sum())
+
 summary = (all_df
-           .groupby("algo")
+           .groupby("algo", as_index=False)
            .agg(avg_goodput_Mbps=("goodput_mbps", "mean"),
                 avg_send_Mbps=("send_mbps", "mean"),
                 avg_cwnd_pkts=("cwnd_pkts", "mean"),
-                loss_events=("loss_event", "sum"))
-           .reset_index())
+                loss_events=("loss_event", "sum")))
+
+# Aggiungi colonne per dup3ack/timeout solo per loss-based
+dup_counts = (all_df[all_df["algo"].isin(list(LOSS_BASED))]
+              .groupby("algo")["event_type"].apply(lambda s: int((s == "dup3ack").sum())))
+to_counts = (all_df[all_df["algo"].isin(list(LOSS_BASED))]
+             .groupby("algo")["event_type"].apply(lambda s: int((s == "timeout").sum())))
+
+summary["dup3ack"] = summary["algo"].map(dup_counts).fillna(0).astype(int)
+summary["timeout"] = summary["algo"].map(to_counts).fillna(0).astype(int)
 
 # Jain's fairness index over average goodput of selected flows
 x = summary["avg_goodput_Mbps"].to_numpy()
@@ -335,6 +443,8 @@ st.dataframe(summary.style.format({
     "avg_send_Mbps": "{:.2f}",
     "avg_cwnd_pkts": "{:.2f}",
     "loss_events": "{:d}",
+    "dup3ack": "{:d}",
+    "timeout": "{:d}",
 }))
 
 st.caption(f"Indice di Jain (goodput medio): {jain:.3f} — più vicino a 1 ⇒ più equità tra algoritmi selezionati.")
@@ -344,9 +454,12 @@ st.markdown(
 **Avvertenze didattiche**  
 Questo modello è intenzionalmente semplificato (passo = 1 RTT, perdite i.i.d., code trascurate,
 assenza di SACK/ACK clock reali, pacing semplificato per BBR). Serve per *intuire* le differenze qualitative
-tra TCP Tahoe/Reno/NewReno, CUBIC e le famiglie Vegas/BBR in presenza di:
-- banda = 100 Mbps, RTT = 100 ms, perdita = 5% (valori modificabili nella sidebar)
+tra TCP Tahoe/Reno, CUBIC, Vegas e BBR in presenza di:
+- banda e RTT base impostabili nella sidebar
+- (opzionale) **variazione di banda e/o RTT** per-RTT uniforme nell’intervallo ±X%
+- perdita impostata in **percentuale** (es. 0.05 = 0.05%)
+- negli algoritmi **loss-based** si distinguono **3dupACK** e **Timeout** con euristica semplificata
 
-Per esperimenti più fedeli: ns‑3, Mininet, o Linux con `tc` e `netem`.
+Per esperimenti più fedeli: ns-3, Mininet, o Linux con `tc` e `netem`.
 """
 )
