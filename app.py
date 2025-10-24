@@ -39,7 +39,7 @@ class Path:
         return compute_bdp_packets(self.bandwidth_mbps, self.rtt_ms, self.mss_bytes)
 
 def effective_cwnd_pkts(cwnd_pkts: float, path: Path) -> float:
-    """cwnd effettiva considerando il limite rwnd (in pacchetti)."""
+    """cwnd effettiva considerando il limite rwnd (in MSS)."""
     cw = max(1.0, cwnd_pkts)
     if path.rwnd_bytes is None or path.rwnd_bytes <= 0:
         return cw
@@ -93,6 +93,8 @@ class CCState:
     epoch: int = 0
     # BBR state
     btlbw_mbps: float = 0.0
+    # Vegas state (per Expected-Actual)
+    base_rtt_ms: float = float("inf")
 
 # Tahoe (loss-based)
 def step_tahoe(state: CCState, path: Path, rng: RNG) -> Tuple[CCState, Dict]:
@@ -106,7 +108,8 @@ def step_tahoe(state: CCState, path: Path, rng: RNG) -> Tuple[CCState, Dict]:
     if loss_happened:
         event = classify_loss_event(eff_cw, rng)
         # Tahoe: su dup3ack e su timeout si torna a cwnd=1, ssthresh = cwnd/2
-        state.ssthresh = max(2.0, state.cwnd / 2.0)
+        pre = state.cwnd
+        state.ssthresh = max(2.0, pre / 2.0)
         state.cwnd = 1.0
     return state, {"loss": loss_happened, "event": event}
 
@@ -121,12 +124,13 @@ def step_reno(state: CCState, path: Path, rng: RNG) -> Tuple[CCState, Dict]:
         state.cwnd += 1.0
     if loss_happened:
         event = classify_loss_event(eff_cw, rng)
+        pre = state.cwnd
         if event == "dup3ack":
             # Fast retransmit + fast recovery (approx)
-            state.ssthresh = max(2.0, state.cwnd / 2.0)
+            state.ssthresh = max(2.0, pre / 2.0)
             state.cwnd = max(1.0, state.ssthresh)
         else:  # timeout
-            state.ssthresh = max(2.0, state.cwnd / 2.0)
+            state.ssthresh = max(2.0, pre / 2.0)
             state.cwnd = 1.0
     return state, {"loss": loss_happened, "event": event}
 
@@ -159,20 +163,24 @@ def step_cubic(state: CCState, path: Path, rng: RNG) -> Tuple[CCState, Dict]:
         state.epoch += 1
     return state, {"loss": loss_happened, "event": event}
 
-# Vegas (delay-inspired; reagisce poco alla perdita)
+# Vegas (delay-inspired; Expected vs Actual con baseRTT)
 def step_vegas(state: CCState, path: Path, rng: RNG) -> Tuple[CCState, Dict]:
+    # aggiorna baseRTT
+    state.base_rtt_ms = min(state.base_rtt_ms, path.rtt_ms)
+    # expected/actual (in pkts/RTT)
+    expected = max(1e-9, state.cwnd)
+    actual = expected * (state.base_rtt_ms / max(1e-9, path.rtt_ms))
+    diff = expected - actual  # MSS "in coda"
     alpha, beta = 3.0, 6.0
-    target_low = path.bdp_packets + alpha
-    target_high = path.bdp_packets + beta
-    if state.cwnd < target_low:
+    if diff < alpha:
         state.cwnd += 1.0
-    elif state.cwnd > target_high:
+    elif diff > beta:
         state.cwnd = max(1.0, state.cwnd - 1.0)
+    # reazione blanda alla perdita
     eff_cw = effective_cwnd_pkts(state.cwnd, path)
     loss_evt = rng.bernoulli(window_loss_event_prob(eff_cw, path.loss_prob))
     if loss_evt:
-        state.cwnd = max(1.0, state.cwnd * 0.9)
-    # Non etichettiamo dup3ack/timeout per gli algoritmi non loss-based
+        state.cwnd = max(1.0, state.cwnd * 0.95)
     return state, {"loss": loss_evt, "event": "none"}
 
 # BBR (model-based)
@@ -206,6 +214,12 @@ COLOR_MAP = {
 
 LOSS_BASED = {"Tahoe", "Reno", "CUBIC"}
 
+# Event markers (fixed across algorithms)
+EVENT_STYLE = {
+    "dup3ack": dict(symbol="x", size=10, line=dict(width=1.8), color="#e377c2"),  # magenta
+    "timeout": dict(symbol="x", size=10, line=dict(width=2.0), color="#7f7f7f"),  # grey
+}
+
 # ------------------------------
 # Simulation engine
 # ------------------------------
@@ -231,6 +245,7 @@ def simulate(algo: str, base_path: Path, duration_s: float, seed: int) -> pd.Dat
     goodputs = []
     loss_flags = []
     event_types = []  # 'none' | 'dup3ack' | 'timeout'
+    algo_bases = []   # NEW: nome algoritmo base (senza etichette rwnd)
 
     step_fn = ALGORITHMS[algo]
 
@@ -284,6 +299,7 @@ def simulate(algo: str, base_path: Path, duration_s: float, seed: int) -> pd.Dat
         eff_cwnds.append(eff_cw)
         send_rates.append(send_rate_mbps)
         goodputs.append(goodput_mbps)
+        algo_bases.append(algo)
 
         # Advance CC by one RTT
         state, meta = step_fn(state, path, rng)
@@ -301,27 +317,45 @@ def simulate(algo: str, base_path: Path, duration_s: float, seed: int) -> pd.Dat
         "goodput_mbps": goodputs,
         "loss_event": loss_flags,
         "event_type": event_types,  # 'none' | 'dup3ack' | 'timeout'
-        "algo": algo,
+        "algo": algo,               # verrà eventualmente sostituito con etichetta
+        "algo_base": algo_bases,    # NEW: sempre il nome "puro"
     })
+    df["is_loss_based"] = df["algo_base"].isin(list(LOSS_BASED))  # NEW
     return df
 
 # ------------------------------
 # Streamlit UI
 # ------------------------------
 st.set_page_config(page_title="TCP CC toy simulator", layout="wide")
-st.title("TCP Congestion Control – simulatore didattico")
+st.title("Controllo della congestione in TCP")
 
 with st.sidebar:
-    st.header("Parametri del link")
+    st.header("Parametri del collegamento bottleneck")
     bw = st.number_input("Banda base (Mbps)", 1.0, 10000.0, 100.0, 1.0)
     rtt = st.number_input("RTT base (ms)", 1.0, 2000.0, 100.0, 1.0)
 
-    # Flow control (rwnd)
-    use_rwnd = st.checkbox("Applica limite finestra ricevitore (rwnd)", value=False,
-                           help="Se attivo, la finestra di invio è limitata dal rwnd pubblicizzato dal ricevitore.")
-    rwnd_bytes = None
+    # Flow control (rwnd) — multipli in KB
+    use_rwnd = st.checkbox(
+        "Applica rwnd", value=False,
+        help="Se attivo, la finestra di invio è limitata dal rwnd pubblicizzato dal ricevitore."
+    )
+    rwnd_kb_list: List[float] = []
     if use_rwnd:
-        rwnd_bytes = st.number_input("rwnd (Bytes)", min_value=1024.0, max_value=1e9, value=65535.0, step=1024.0)
+        rwnd_kb_str = st.text_input(
+            "rwnd (KB) — uno o più valori separati da virgola",
+            value="64",
+            help="Esempi: 64  oppure  64, 256, 1024"
+        )
+        rwnd_kb_list = []
+        for tok in rwnd_kb_str.replace(";", ",").split(","):
+            tok = tok.strip()
+            if tok:
+                try:
+                    val = float(tok)
+                    if val > 0:
+                        rwnd_kb_list.append(val)
+                except ValueError:
+                    pass
 
     # Percent input for very low loss rates
     loss_pct = st.number_input(
@@ -361,30 +395,44 @@ with st.sidebar:
     )
 
     st.header("Cosa visualizzare")
-    what = st.radio("Serie temporali", ["Goodput (Mbps)", "cwnd (pacchetti)", "Send rate (Mbps)"])
-    show_events = st.checkbox("Evidenzia 3dupACK e Timeout (solo algoritmi loss-based)", value=True)
-    show_eff_cwnd = st.checkbox("Mostra cwnd effettiva (min(cwnd, rwnd)) in tabella", value=True)
+    what = st.radio("Serie temporali", ["Goodput (Mbps)", "cwnd (MSS)", "Send rate (Mbps)"])
+    show_events = st.checkbox("Evidenzia eventi di perdita", value=True)
+    show_eff_cwnd = st.checkbox("Mostra finestra effettiva in tabella", value=True)
 
-# Build base path (variation fractions included)
+# Build base path (variation fractions included) — rwnd rimane None, gestito in sweep
 path = Path(bandwidth_mbps=bw, rtt_ms=rtt, loss_prob=loss, mss_bytes=mss,
             bw_variation_frac=bw_var_frac, rtt_variation_frac=rtt_var_frac,
-            rwnd_bytes=rwnd_bytes)
+            rwnd_bytes=None)
 
 if not algos_selected:
     st.info("Seleziona almeno un algoritmo nella sidebar per iniziare.")
     st.stop()
 
-# Run simulations
+# Run simulations (sweep su rwnd KB se attivo)
 frames: List[pd.DataFrame] = []
+rwnd_sweep = rwnd_kb_list if use_rwnd and len(rwnd_kb_list) > 0 else [None]
+
 for name in algos_selected:
-    frames.append(simulate(name, path, duration, seed))
+    for rwnd_kb in rwnd_sweep:
+        sim_path = Path(**{**path.__dict__})
+        label = name
+        if rwnd_kb is not None:
+            sim_path.rwnd_bytes = rwnd_kb * 1024.0
+            label = f"{name} (rwnd {int(rwnd_kb)}KB)"
+        df = simulate(name, sim_path, duration, seed)
+        df["algo"] = label                 # etichetta mostrata
+        # is_loss_based già presente; algo_base già presente
+        frames.append(df)
+
 all_df = pd.concat(frames, ignore_index=True)
+all_df["color_key"] = all_df["algo_base"]
+
 
 # KPIs
 base_bdp = compute_bdp_packets(bw, rtt, mss)
 cols = st.columns(6)
 with cols[0]:
-    st.metric("BDP base (pacchetti)", f"{base_bdp:.1f}")
+    st.metric("BDP base (MSS)", f"{base_bdp:.1f}")
 with cols[1]:
     st.metric("Capacità base", f"{bw:.1f} Mbps")
 with cols[2]:
@@ -395,27 +443,25 @@ with cols[4]:
     st.metric("Var. banda ±", f"{100*path.bw_variation_frac:.0f}%")
 with cols[5]:
     st.metric("Var. RTT ±", f"{100*path.rtt_variation_frac:.0f}%")
-if path.rwnd_bytes:
-    st.metric("rwnd (pacchetti)", f"{path.rwnd_bytes / mss:.1f}")
 
 # Plot
 metric_map = {
     "Goodput (Mbps)": ("goodput_mbps", "Goodput (Mbps)"),
-    "cwnd (pacchetti)": ("cwnd_pkts", "cwnd (pacchetti)"),
+    "cwnd (MSS)": ("cwnd_pkts", "cwnd (MSS)"),
     "Send rate (Mbps)": ("send_mbps", "Send rate (Mbps)"),
 }
 col, ylab = metric_map[what]
 
 fig = px.line(
-    all_df, x="time_s", y=col, color="algo", render_mode="svg",
-    color_discrete_map=COLOR_MAP,
+    all_df, x="time_s", y=col, color="color_key", render_mode="svg",
+    color_discrete_map=COLOR_MAP, line_group="algo",
 )
 fig.update_layout(xaxis_title="Tempo (s)", yaxis_title=ylab, legend_title_text="Algoritmo",
                   template="plotly_white")
 
 if show_events:
-    # Solo algoritmi loss-based
-    events_df = all_df[all_df["algo"].isin(list(LOSS_BASED))]
+    # Solo algoritmi loss-based (indipendente dall'etichetta visualizzata)
+    events_df = all_df[all_df["is_loss_based"]]
     # 3dupACK
     dup_df = events_df[events_df["event_type"] == "dup3ack"]
     if not dup_df.empty:
@@ -423,9 +469,10 @@ if show_events:
             x=dup_df["time_s"],
             y=dup_df[col],
             mode="markers",
-            marker=dict(symbol="triangle-down-open", size=10, line=dict(width=1.8, color="#ff7f0e")),
+            marker=EVENT_STYLE["dup3ack"],
             name="3dupACK",
             showlegend=True,
+            hovertemplate="Evento: 3dupACK<br>t=%{x:.3f}s<br>"+ylab+": %{y:.3f}<extra></extra>",
         ))
     # Timeout
     to_df = events_df[events_df["event_type"] == "timeout"]
@@ -434,9 +481,10 @@ if show_events:
             x=to_df["time_s"],
             y=to_df[col],
             mode="markers",
-            marker=dict(symbol="x-thin", size=11, line=dict(width=2.0, color="#111111")),
-            name="Timeout",
+            marker=EVENT_STYLE["timeout"],
+            name="timeout",
             showlegend=True,
+            hovertemplate="Evento: Timeout<br>t=%{x:.3f}s<br>"+ylab+": %{y:.3f}<extra></extra>",
         ))
 
 st.plotly_chart(fig, use_container_width=True)
@@ -454,10 +502,10 @@ summary = (all_df
            .groupby("algo", as_index=False)
            .agg(**{k: pd.NamedAgg(*v) for k, v in agg_cols.items()}))
 
-# Aggiungi colonne per dup3ack/timeout solo per loss-based
-dup_counts = (all_df[all_df["algo"].isin(list(LOSS_BASED))]
+# Aggiungi colonne per dup3ack/timeout solo per loss-based (usiamo la maschera)
+dup_counts = (all_df[all_df["is_loss_based"]]
               .groupby("algo")["event_type"].apply(lambda s: int((s == "dup3ack").sum())))
-to_counts = (all_df[all_df["algo"].isin(list(LOSS_BASED))]
+to_counts = (all_df[all_df["is_loss_based"]]
              .groupby("algo")["event_type"].apply(lambda s: int((s == "timeout").sum())))
 
 summary["dup3ack"] = summary["algo"].map(dup_counts).fillna(0).astype(int)
@@ -498,7 +546,7 @@ tra TCP Tahoe/Reno, CUBIC, Vegas e BBR in presenza di:
 - banda e RTT base impostabili nella sidebar
 - (opzionale) **variazione di banda e/o RTT** per-RTT uniforme nell’intervallo ±X%
 - perdita impostata in **percentuale** (es. 0.05 = 0.05%)
-- **flow control**: se attivo, `rwnd` limita l'invio a `min(cwnd, rwnd)`
+- **flow control**: se attivo, `rwnd` limita l'invio a `min(cwnd, rwnd)`; puoi inserire **più valori in KB**
 - negli algoritmi **loss-based** si distinguono **3dupACK** e **Timeout** con euristica semplificata
 
 Per esperimenti più fedeli: ns-3, Mininet, o Linux con `tc` e `netem`.
