@@ -1,4 +1,3 @@
-# streamlit_app.py
 # TCP congestion control toy simulator with algorithm picker
 # NOTE: This is a *didactic* discrete-RTT model. It is not ns-3 nor Linux TCP.
 # It aims to visualize trends and relative behaviors under configurable path params.
