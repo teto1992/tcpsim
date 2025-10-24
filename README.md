@@ -7,7 +7,7 @@ Why this repo
 - Good for teaching, quick prototyping, and intuition-building (not a packet‑accurate simulator).
 
 Features
-- Multiple algorithms: Tahoe, Reno, NewReno, CUBIC, Vegas, NewVegas, BBR.
+- Multiple algorithms: Tahoe, Reno, CUBIC, Vegas, BBR.
 - Configurable path: bandwidth, RTT, per-packet loss, MSS, queue/BDP intuition.
 - Simple time‑series outputs: cwnd, send rate, goodput, and loss events.
 - Interactive UI using Streamlit (app.py).
