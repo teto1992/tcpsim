@@ -360,13 +360,12 @@ with st.sidebar:
 
     mss = st.selectbox("MSS (bytes)", [1200, 1360, 1460, 1500], index=2)
 
-    st.header("Variazioni bottleneck")
-    bw_var_pct = st.slider("variazione ± (%)", 0, 50, 0, 1,
+    st.header("Variazioni del collegamento bottleneck")
+    bw_var_pct = st.slider("Banda ± (%)", 0, 50, 0, 1,
                            help="Se >0, ad ogni RTT la banda varia in modo uniforme casuale nell'intervallo selezionato.")
     bw_var_frac = bw_var_pct / 100.0
 
-    st.header("RTT ± (%)")
-    rtt_var_pct = st.slider("variazione ± (%)", 0, 50, 0, 1,
+    rtt_var_pct = st.slider("RTT ± (%)", 0, 50, 0, 1,
                             help="Se >0, ad ogni RTT il RTT varia in modo uniforme casuale nell'intervallo selezionato.")
     rtt_var_frac = rtt_var_pct / 100.0
 
