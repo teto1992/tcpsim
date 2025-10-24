@@ -1,3 +1,4 @@
+# streamlit_app.py
 # TCP congestion control toy simulator with algorithm picker
 # NOTE: This is a *didactic* discrete-RTT model. It is not ns-3 nor Linux TCP.
 # It aims to visualize trends and relative behaviors under configurable path params.
@@ -330,31 +331,20 @@ st.title("Controllo della congestione in TCP")
 
 with st.sidebar:
     st.header("Parametri del collegamento bottleneck")
-    bw = st.number_input("Banda base (Mbps)", 1.0, 10000.0, 100.0, 1.0)
-    rtt = st.number_input("RTT base (ms)", 1.0, 2000.0, 100.0, 1.0)
+    bw = st.number_input("Banda (Mbps)", 1.0, 10000.0, 100.0, 1.0)
+    rtt = st.number_input("RTT (ms)", 1.0, 2000.0, 100.0, 1.0)
 
-    # Flow control (rwnd) — multipli in KB
+    # Flow control (rwnd) — singolo valore in KB
     use_rwnd = st.checkbox(
-        "Applica rwnd", value=False,
+        "Applica limite finestra ricevitore (rwnd)", value=False,
         help="Se attivo, la finestra di invio è limitata dal rwnd pubblicizzato dal ricevitore."
     )
-    rwnd_kb_list: List[float] = []
+    rwnd_kb = None
     if use_rwnd:
-        rwnd_kb_str = st.text_input(
-            "rwnd (KB) — uno o più valori separati da virgola",
-            value="64",
-            help="Esempi: 64  oppure  64, 256, 1024"
+        rwnd_kb = st.number_input(
+            "rwnd (KB)", min_value=1.0, max_value=1048576.0, value=64.0, step=1.0,
+            help="Valore singolo in kilobyte (KB)."
         )
-        rwnd_kb_list = []
-        for tok in rwnd_kb_str.replace(";", ",").split(","):
-            tok = tok.strip()
-            if tok:
-                try:
-                    val = float(tok)
-                    if val > 0:
-                        rwnd_kb_list.append(val)
-                except ValueError:
-                    pass
 
     # Percent input for very low loss rates
     loss_pct = st.number_input(
@@ -407,21 +397,18 @@ if not algos_selected:
     st.info("Seleziona almeno un algoritmo nella sidebar per iniziare.")
     st.stop()
 
-# Run simulations (sweep su rwnd KB se attivo)
+# Run simulations (singolo valore di rwnd se attivo)
 frames: List[pd.DataFrame] = []
-rwnd_sweep = rwnd_kb_list if use_rwnd and len(rwnd_kb_list) > 0 else [None]
 
 for name in algos_selected:
-    for rwnd_kb in rwnd_sweep:
-        sim_path = Path(**{**path.__dict__})
-        label = name
-        if rwnd_kb is not None:
-            sim_path.rwnd_bytes = rwnd_kb * 1024.0
-            label = f"{name} (rwnd {int(rwnd_kb)}KB)"
-        df = simulate(name, sim_path, duration, seed)
-        df["algo"] = label                 # etichetta mostrata
-        # is_loss_based già presente; algo_base già presente
-        frames.append(df)
+    sim_path = Path(**{**path.__dict__})
+    label = name
+    if use_rwnd and (rwnd_kb is not None):
+        sim_path.rwnd_bytes = rwnd_kb * 1024.0
+        label = f"{name} (rwnd {int(rwnd_kb)}KB)"
+    df = simulate(name, sim_path, duration, seed)
+    df["algo"] = label                 # etichetta mostrata
+    frames.append(df)
 
 all_df = pd.concat(frames, ignore_index=True)
 all_df["color_key"] = all_df["algo_base"]
